@@ -1,0 +1,307 @@
+###############################################################################
+#  Production Inference Stack — Вариант D
+#  RTX PRO 6000 Blackwell (96 GB GDDR7)
+#
+#  AI-слой:   GPT-OSS-120B + Giga-Embeddings + Qdrant
+#  Infra:     PostgreSQL + Redis + Traefik + n8n
+#  Frontend:  статический сайт (или SPA) через Traefik
+#
+#  Домены (настроить в .env):
+#    ai.example.com       → API-шлюз (LLM + Embedder)
+#    n8n.example.com      → n8n UI
+#    chat.example.com     → веб-приложение (фронтенд)
+#    qdrant.example.com   → Qdrant Dashboard (опционально)
+#
+#  Запуск:
+#    1. cp .env.example .env && nano .env
+#    2. docker compose up -d
+###############################################################################
+
+services:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  REVERSE PROXY — Traefik v3
+  #  Автоматический SSL (Let's Encrypt), роутинг по доменам
+  # ═══════════════════════════════════════════════════════════════════════════
+  traefik:
+    image: traefik:v3.6.10
+    container_name: traefik
+    restart: unless-stopped
+    environment:
+      - DOCKER_API_VERSION=1.40
+    command:
+      - --api.dashboard=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      # HTTP → HTTPS редирект
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      # Let's Encrypt
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      # Логи
+      - --accesslog=true
+      - --log.level=WARN
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_certs:/letsencrypt
+    labels:
+      # Traefik Dashboard (опционально, защищён BasicAuth)
+      - traefik.enable=true
+      - traefik.http.routers.traefik-dashboard.rule=Host(`traefik.${DOMAIN}`)
+      - traefik.http.routers.traefik-dashboard.entrypoints=websecure
+      - traefik.http.routers.traefik-dashboard.tls.certresolver=letsencrypt
+      - traefik.http.routers.traefik-dashboard.service=api@internal
+      - traefik.http.routers.traefik-dashboard.middlewares=auth
+      - traefik.http.middlewares.auth.basicauth.users=${TRAEFIK_AUTH}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  DATABASE — PostgreSQL 16
+  #  Хранение: n8n workflows, credentials, execution history
+  # ═══════════════════════════════════════════════════════════════════════════
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-n8n}
+      - POSTGRES_USER=${POSTGRES_USER:-n8n}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-n8n}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  CACHE / QUEUE — Redis 7
+  #  n8n queue mode, кэширование эмбеддингов (опционально)
+  # ═══════════════════════════════════════════════════════════════════════════
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  LLM — GPT-OSS-120B (MXFP4, ~65 GB VRAM)
+  # ═══════════════════════════════════════════════════════════════════════════
+  gpt-oss-120b:
+    image: vllm/vllm-openai:latest
+    container_name: gpt-oss-120b
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    command: >
+      --model openai/gpt-oss-120b
+      --dtype auto
+      --max-model-len 65536
+      --gpu-memory-utilization 0.85
+      --served-model-name gpt-oss-120b
+      --trust-remote-code
+      --enable-auto-tool-choice
+      --tool-call-parser openai
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    labels:
+      - traefik.enable=true
+      # Роут: ai.DOMAIN/v1/* → vLLM
+      - traefik.http.routers.llm.rule=Host(`ai.${DOMAIN}`) && PathPrefix(`/v1`)
+      - traefik.http.routers.llm.entrypoints=websecure
+      - traefik.http.routers.llm.tls.certresolver=letsencrypt
+      - traefik.http.routers.llm.middlewares=api-key-check
+      - traefik.http.services.llm.loadbalancer.server.port=8000
+      # Простая проверка API-ключа через header
+      - traefik.http.middlewares.api-key-check.headers.customrequestheaders.X-Forwarded-Proto=https
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  ЭМБЕДДЕР — Giga-Embeddings-instruct (~7 GB VRAM)
+  # ═══════════════════════════════════════════════════════════════════════════
+  giga-embeddings:
+    build:
+      context: ./giga-embeddings
+      dockerfile: Dockerfile
+    container_name: giga-embeddings
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - MODEL_NAME=ai-sage/Giga-Embeddings-instruct
+      - MAX_BATCH_SIZE=32
+      - PORT=8000
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    labels:
+      - traefik.enable=true
+      # Роут: ai.DOMAIN/embed* → embedder
+      - traefik.http.routers.embedder.rule=Host(`ai.${DOMAIN}`) && PathPrefix(`/embed`)
+      - traefik.http.routers.embedder.entrypoints=websecure
+      - traefik.http.routers.embedder.tls.certresolver=letsencrypt
+      - traefik.http.services.embedder.loadbalancer.server.port=8000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  ВЕКТОРНАЯ БД — Qdrant
+  # ═══════════════════════════════════════════════════════════════════════════
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
+    labels:
+      - traefik.enable=true
+      # Qdrant Dashboard (опционально)
+      - traefik.http.routers.qdrant.rule=Host(`qdrant.${DOMAIN}`)
+      - traefik.http.routers.qdrant.entrypoints=websecure
+      - traefik.http.routers.qdrant.tls.certresolver=letsencrypt
+      - traefik.http.services.qdrant.loadbalancer.server.port=6333
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  ОРКЕСТРАЦИЯ — n8n (production mode: PostgreSQL + Redis queue)
+  # ═══════════════════════════════════════════════════════════════════════════
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    environment:
+      # Database
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB:-n8n}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER:-n8n}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      # Queue mode (Redis)
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      # General
+      - N8N_SECURE_COOKIE=true
+      - N8N_PROTOCOL=https
+      - N8N_HOST=n8n.${DOMAIN}
+      - WEBHOOK_URL=https://n8n.${DOMAIN}/
+      - GENERIC_TIMEZONE=Europe/Moscow
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      # Внутренние URL сервисов
+      - LLM_API_URL=http://gpt-oss-120b:8000/v1
+      - EMBEDDER_URL=http://giga-embeddings:8000
+      - QDRANT_URL=http://qdrant:6333
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.n8n.rule=Host(`n8n.${DOMAIN}`)
+      - traefik.http.routers.n8n.entrypoints=websecure
+      - traefik.http.routers.n8n.tls.certresolver=letsencrypt
+      - traefik.http.services.n8n.loadbalancer.server.port=5678
+
+  # n8n Worker — обработка очереди (отдельный процесс)
+  n8n-worker:
+    image: n8nio/n8n:latest
+    container_name: n8n-worker
+    restart: unless-stopped
+    command: worker
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB:-n8n}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER:-n8n}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - GENERIC_TIMEZONE=Europe/Moscow
+      - LLM_API_URL=http://gpt-oss-120b:8000/v1
+      - EMBEDDER_URL=http://giga-embeddings:8000
+      - QDRANT_URL=http://qdrant:6333
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  ФРОНТЕНД — Vite/React SPA из local-ai-chat
+  # ═══════════════════════════════════════════════════════════════════════════
+  frontend:
+    build:
+      context: ./local-ai-chat
+    container_name: frontend
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.frontend.rule=Host(`chat.${DOMAIN}`)
+      - traefik.http.routers.frontend.entrypoints=websecure
+      - traefik.http.routers.frontend.tls.certresolver=letsencrypt
+      - traefik.http.services.frontend.loadbalancer.server.port=80
+
+volumes:
+  hf_cache:
+    driver: local
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  qdrant_data:
+    driver: local
+  n8n_data:
+    driver: local
+  traefik_certs:
+    driver: local
